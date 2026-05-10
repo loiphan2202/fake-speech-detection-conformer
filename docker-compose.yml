@@ -1,0 +1,24 @@
+services:
+  deepfake-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: deepfake-detector-app
+
+    ports:
+      - "7860:7860"
+
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./app.py:/app/app.py
+      - ./predict.py:/app/predict.py
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    tty: true
+    stdin_open: true
+
+    restart: unless-stopped

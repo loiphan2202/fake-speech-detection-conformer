@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.venv2/
+venv/
+env/
+
+# Gradio
+.gradio/
+
+# Model weights (too large for GitHub)
+models/*.h5
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Docx files
+*.docx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Docker
+.dockerignore
+
+# History plots
+history_plot.png
+
+# pip cache
+.pip/
