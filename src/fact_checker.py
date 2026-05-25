@@ -88,8 +88,10 @@ def fact_check_text(text: str, lang: str = "vi") -> dict:
     sources = search_news(claim, lang=lang)
 
     # Chạy fake-news classifier
-    clf    = _get_fact_pipeline()
-    result = clf(text[:512])[0]
+    # Model yêu cầu format: <title> TITLE <content> CONTENT <end>
+    clf       = _get_fact_pipeline()
+    input_str = f"<title> {claim} <content> {text} <end>"
+    result    = clf(input_str[:512])[0]
     label  = result["label"]
     score  = result["score"]
 

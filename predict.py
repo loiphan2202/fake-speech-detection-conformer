@@ -15,7 +15,7 @@ def run_analysis(audio_path: str, language: str = None, deepfake_only: bool = Fa
 
     # 1. Deepfake detection
     try:
-        detector = DeepfakeDetector("models/ckpt.h5")
+        detector = DeepfakeDetector("models/ckpt.weights.h5")
         spec     = preprocess_audio(audio_path)
         df       = detector.predict(spec)
         print(f"\n[🎙️ VOICE AUTHENTICITY]")

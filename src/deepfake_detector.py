@@ -3,10 +3,12 @@ deepfake_detector.py
 --------------------
 Load Conformer model (weights-only .h5) và thực hiện dự đoán deepfake.
 
-QUAN TRỌNG: ckpt.h5 là weights-only checkpoint.
+QUAN TRỌNG: ckpt.weights.h5 là weights-only checkpoint.
 Phải rebuild architecture giống hệt notebook training rồi mới load_weights().
 """
 
+import re
+import h5py
 import numpy as np
 import tensorflow as tf
 
@@ -14,50 +16,204 @@ import tensorflow as tf
 SPEC_SHAPE  = [256, 128]
 INPUT_SHAPE = (256, 128, 1)
 
+# ── Các layer tự định nghĩa giống hệt notebook training ─────────────
+
+class ConformerConvSubsampling(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, **kwargs):
+        super().__init__(**kwargs)
+        self.conv1 = tf.keras.layers.Conv2D(
+            d_model, 3, 2, padding='same', activation='relu', name='conv1')
+        self.conv2 = tf.keras.layers.Conv2D(
+            d_model, 3, 2, padding='same', activation='relu', name='conv2')
+        self.linear = tf.keras.layers.Dense(d_model, name='linear')
+    def call(self, x, training=False):
+        x = self.conv1(x, training=training)
+        x = self.conv2(x, training=training)
+        b, t, f, c = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
+        x = tf.reshape(x, [b, t, f * c])
+        x = self.linear(x)
+        return x
+
+class FeedForwardModule(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.layers = [
+            tf.keras.layers.LayerNormalization(epsilon=1e-6, name='layer_normalization'),
+            tf.keras.layers.Dense(d_model * 4, activation=tf.nn.swish, name='dense'),
+            tf.keras.layers.Dropout(dropout, name='dropout'),
+            tf.keras.layers.Dense(d_model, name='dense_1'),
+            tf.keras.layers.Dropout(dropout, name='dropout_1'),
+        ]
+    def call(self, x, training=False):
+        for layer in self.layers:
+            x = layer(x, training=training) if isinstance(layer, tf.keras.layers.Dropout) else layer(x)
+        return x
+
+class MultiHeadSelfAttentionModule(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, n_head=4, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-6, name='norm')
+        self.attn = tf.keras.layers.MultiHeadAttention(n_head, d_model, dropout=dropout, name='attn')
+        self.dropout = tf.keras.layers.Dropout(dropout, name='dropout')
+    def call(self, x, training=False):
+        x_norm = self.norm(x)
+        attn_out = self.attn(x_norm, x_norm)
+        x = x + self.dropout(attn_out, training=training)
+        return x
+
+class ConvolutionModule(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, kernel_size=31, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-6, name='norm')
+        self.pw_conv1 = tf.keras.layers.Conv1D(d_model * 2, 1, name='pw_conv1')
+        self.dw_conv = tf.keras.layers.DepthwiseConv1D(kernel_size, padding='same', name='dw_conv')
+        self.batch_norm = tf.keras.layers.BatchNormalization(name='batch_norm')
+        self.pw_conv2 = tf.keras.layers.Conv1D(d_model, 1, name='pw_conv2')
+        self.dropout = tf.keras.layers.Dropout(dropout, name='dropout')
+    def call(self, x, training=False):
+        x = self.norm(x)
+        x = self.pw_conv1(x)
+        x_glu, x_lin = tf.split(x, 2, axis=-1)
+        x = x_glu * tf.nn.sigmoid(x_lin)
+        x = self.dw_conv(x)
+        x = self.batch_norm(x, training=training)
+        x = tf.nn.swish(x)
+        x = self.pw_conv2(x)
+        x = self.dropout(x, training=training)
+        return x
+
+class ConformerBlock(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, n_head=4, conv_kernel=31, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.ffn1 = FeedForwardModule(d_model, dropout, name='ffn1')
+        self.mhsa = MultiHeadSelfAttentionModule(d_model, n_head, dropout, name='mhsa')
+        self.conv = ConvolutionModule(d_model, conv_kernel, dropout, name='conv')
+        self.ffn2 = FeedForwardModule(d_model, dropout, name='ffn2')
+        self.norm = tf.keras.layers.LayerNormalization(epsilon=1e-6, name='norm')
+        self.dropout = tf.keras.layers.Dropout(dropout, name='dropout')
+    def call(self, x, training=False, mask=None):
+        x = x + 0.5 * self.ffn1(x, training=training)
+        x = x + self.mhsa(x, training=training)
+        x = x + self.conv(x, training=training)
+        x = x + 0.5 * self.ffn2(x, training=training)
+        x = self.norm(x)
+        x = self.dropout(x, training=training)
+        return x
+
+class ConformerEncoder(tf.keras.layers.Layer):
+    def __init__(self, d_model=144, n_blocks=8, n_head=4,
+                 conv_kernel=31, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.subsampling = ConformerConvSubsampling(d_model, name='subsampling')
+        self.linear = tf.keras.layers.Dense(d_model, name='linear')
+        self.blocks = [ConformerBlock(d_model, n_head, conv_kernel, dropout,
+                                      name=f'conformer_block_{i}' if i > 0 else 'conformer_block')
+                       for i in range(n_blocks)]
+    def call(self, x, training=False, mask=None):
+        x = self.subsampling(x, training=training)
+        x = self.linear(x)
+        for block in self.blocks:
+            x = block(x, training=training)
+        return x
+
+
+def _load_weights_manual(model: tf.keras.Model, filepath: str):
+    """Load weights từ HDF5 checkpoint, map tên variables từ model
+    sang đường dẫn trong file (do khác TF version nên tên layer không khớp)."""
+    # ── Đọc toàn bộ weight data từ file (bỏ qua optimizer) ──
+    with h5py.File(filepath, "r") as f:
+        ckpt_data = {}
+        def _collect(name, obj):
+            if isinstance(obj, h5py.Dataset) and not name.startswith("optimizer/"):
+                ckpt_data[name] = obj[()]
+        f.visititems(_collect)
+
+    # ── Map: model variable name → file dataset path ──
+    # Model: "conformer_encoder/subsampling/linear/kernel:0"
+    # File:  "layers/conformer_encoder/subsampling/linear/vars/0"
+    # Rule:  thêm "layers/" prefix, thay var_name → vars/{idx}
+    VAR_TO_IDX = {
+        "kernel": "0", "bias": "1",
+        "gamma": "0", "beta": "1",
+        "moving_mean": "2", "moving_variance": "3",
+        "depthwise_kernel": "0",
+    }
+
+    # Một số tên layer trong model không khớp với file (TF version khác).
+    # File dùng: key_dense, query_dense, value_dense, output_dense
+    # TF mới dùng: key, query, value, attention_output
+    MHA_REMAP = {
+        "key": "key_dense",
+        "query": "query_dense",
+        "value": "value_dense",
+        "attention_output": "output_dense",
+    }
+
+    loaded = 0
+    errors = []
+
+    for v in model.weights:
+        vname = v.name
+        stem = re.sub(r":\d+$", "", vname)
+        parts = stem.split("/")
+
+        var_name = parts[-1]
+        var_idx = VAR_TO_IDX.get(var_name)
+        if var_idx is None:
+            errors.append(f"Unknown variable type '{var_name}' in {vname}")
+            continue
+
+        layer_parts = parts[:-1]
+
+        # Remap MHA internal names (key→key_dense, etc.)
+        for i, p in enumerate(layer_parts):
+            if p in MHA_REMAP:
+                layer_parts[i] = MHA_REMAP[p]
+
+        # Checkpoint có thêm "blocks/" giữa conformer_encoder và conformer_block
+        # và thêm "layers/" giữa ffn1/ffn2 và layer con (do list attribute)
+        # Model:  conformer_encoder/conformer_block/ffn1/dense/kernel:0
+        # File:   layers/conformer_encoder/blocks/conformer_block/ffn1/layers/dense/vars/0
+        inserted = []
+        for p in layer_parts:
+            if p.startswith("conformer_block") and inserted and inserted[-1] == "conformer_encoder":
+                inserted.append("blocks")
+            # Thêm "layers/" trước layer_normalization, dense, dense_1 ngay sau ffn1/ffn2
+            if p in ("layer_normalization", "dense", "dense_1") and inserted and inserted[-1] in ("ffn1", "ffn2"):
+                inserted.append("layers")
+            inserted.append(p)
+
+        fpath = "layers/" + "/".join(inserted) + f"/vars/{var_idx}"
+
+        if fpath in ckpt_data:
+            data = ckpt_data[fpath]
+            if list(data.shape) == v.shape.as_list():
+                v.assign(data)
+                loaded += 1
+                continue
+            else:
+                errors.append(
+                    f"Shape mismatch for {fpath}: file {data.shape} vs model {v.shape}"
+                )
+        else:
+            errors.append(f"Path not found: {fpath}")
+
+    if loaded == len(model.weights):
+        print(f"   ✅ Loaded {loaded}/{len(model.weights)} weights")
+    else:
+        print(f"   ⚠ Loaded {loaded}/{len(model.weights)} weights "
+              f"({len(errors)} errors)")
+        for e in errors:
+            print(f"      {e}")
+
 
 def build_conformer_model(input_shape: tuple = INPUT_SHAPE) -> tf.keras.Model:
-    """
-    Rebuild kiến trúc Conformer GIỐNG HỆT notebook training.
-    Dùng audio_classification_models (cần pip install audio_classification_models).
-    """
-    import audio_classification_models as acm
-    from audio_classification_models.models import conformer
-    from audio_classification_models.layers import multihead_attention
-
-    # --- MONKEY PATCH FOR KERAS 2.13+ MASK ISSUE ---
-    # In newer TF/Keras, when inputs is a list, mask is implicitly passed as a list of Nones.
-    # We clean it up so that we don't crash when len(mask.shape) is called on a list.
-    def clean_mask(mask):
-        if isinstance(mask, list):
-            # If it's a list and all elements are None, just return None
-            flattened = tf.nest.flatten(mask)
-            if all(m is None for m in flattened):
-                return None
-        return mask
-
-    orig_cb_call = conformer.ConformerBlock.call
-    def patched_cb_call(self, inputs, training=False, mask=None, **kwargs):
-        return orig_cb_call(self, inputs, training=training, mask=clean_mask(mask), **kwargs)
-    conformer.ConformerBlock.call = patched_cb_call
-
-    orig_mhsa_call = conformer.MHSAModule.call
-    def patched_mhsa_call(self, inputs, training=False, mask=None, **kwargs):
-        return orig_mhsa_call(self, inputs, training=training, mask=clean_mask(mask), **kwargs)
-    conformer.MHSAModule.call = patched_mhsa_call
-
-    orig_rpmha_call = multihead_attention.RelPositionMultiHeadAttention.call
-    def patched_rpmha_call(self, inputs, training=False, mask=None, **kwargs):
-        return orig_rpmha_call(self, inputs, training=training, mask=clean_mask(mask), **kwargs)
-    multihead_attention.RelPositionMultiHeadAttention.call = patched_rpmha_call
-    # ----------------------------------------------
-
-    # Khởi tạo backbone là ConformerEncoder thay vì toàn bộ mô hình Conformer
-    backbone = conformer.ConformerEncoder()
-    
+    """Rebuild kiến trúc Conformer GIỐNG HỆT notebook training."""
     inp = tf.keras.Input(shape=input_shape)
-    x   = backbone(inp)
-    x   = tf.keras.layers.GlobalAveragePooling1D()(x)
-    out = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+    backbone = ConformerEncoder(name='conformer_encoder')
+    out = backbone(inp)
+    out = tf.keras.layers.GlobalAveragePooling1D(name='global_average_pooling1d')(out)
+    out = tf.keras.layers.Dense(1, activation='sigmoid', name='dense')(out)
     return tf.keras.Model(inputs=inp, outputs=out)
 
 
@@ -67,11 +223,10 @@ class DeepfakeDetector:
     Score: 0.0 = Real (Bonafide), 1.0 = Fake (Spoof)
     """
 
-    def __init__(self, model_path: str = "models/ckpt.h5"):
+    def __init__(self, model_path: str = "models/ckpt.weights.h5"):
         print(f"Loading model weights from: {model_path}")
         self.model = build_conformer_model()
-        # Dùng load_weights vì ckpt.h5 là weights-only
-        self.model.load_weights(model_path)
+        _load_weights_manual(self.model, model_path)
         print(f"✅ Model weights loaded successfully")
         print(f"   Input shape  : {self.model.input_shape}")
         print(f"   Output shape : {self.model.output_shape}")

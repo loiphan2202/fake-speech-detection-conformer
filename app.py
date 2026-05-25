@@ -11,7 +11,7 @@ from src.conversation_analyzer import analyze_conversation
 
 print("Khởi tạo hệ thống...")
 # Khởi tạo detector ngay khi app start (sẽ tốn thời gian load architecture)
-detector = DeepfakeDetector("models/ckpt.h5")
+detector = DeepfakeDetector("models/ckpt.weights.h5")
 
 
 def analyze_audio(audio_path: str, language: str = "auto"):
